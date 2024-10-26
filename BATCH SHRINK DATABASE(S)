@@ -142,7 +142,7 @@ GO
 
 --- TO ALL THE DATABASES
 
-CREATE PROCEDURE usp_GenerateShrinkScriptsForAllDatabases
+CREATE OR ALTER PROCEDURE  usp_GenerateShrinkScriptsForAllDatabases
     @ShrinkType NVARCHAR(10) = 'BOTH',      -- Options: 'DATA', 'LOG', or 'BOTH'
     @ShrinkBatchSizeMB INT = 500,           -- Batch size for shrinking (in MB)
     @MaxTotalShrinkableMB INT = NULL        -- Total maximum shrinkable size (in MB), if not specified, it will be calculated based on free space
@@ -251,13 +251,15 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         -- Loop-based command generation with the maximum shrinkable size
-        SET @ShrinkCmd = 'DECLARE @TotalShrinkedMB INT = 0;' + CHAR(13) + CHAR(10) +
+        SET @ShrinkCmd = 'USE ' + QUOTENAME(@DatabaseName) + ';' + CHAR(13) + CHAR(10) +
+                         'DECLARE @TotalShrinkedMB INT = 0;' + CHAR(13) + CHAR(10) +
                          'WHILE @TotalShrinkedMB < ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + CHAR(13) + CHAR(10) +
                          'BEGIN' + CHAR(13) + CHAR(10) +
                          '    DBCC SHRINKFILE (' + QUOTENAME(@FileName) + ', ' + CAST(@BatchSize AS NVARCHAR(10)) + ');' + CHAR(13) + CHAR(10) +
                          '    SET @TotalShrinkedMB += ' + CAST(@BatchSize AS NVARCHAR(10)) + ';' + CHAR(13) + CHAR(10) +
                          '    IF @TotalShrinkedMB + ' + CAST(@BatchSize AS NVARCHAR(10)) + ' > ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + ' BREAK;' + CHAR(13) + CHAR(10) +
-                         'END;';
+                         'END;' + CHAR(13) + CHAR(10) 
+                 ;
 
         UPDATE #AllDatabasesFileInfo
         SET ShrinkCommand = @ShrinkCmd
@@ -288,3 +290,4 @@ BEGIN
     DROP TABLE #AllDatabasesFileInfo;
 END;
 GO
+
