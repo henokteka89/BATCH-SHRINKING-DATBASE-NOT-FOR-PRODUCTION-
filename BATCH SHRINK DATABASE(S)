@@ -1,0 +1,290 @@
+
+-- DONOT APPLY THIS IN PRODUCTION ENVIRONMENT
+-- FOR SINGLE DATABASES BASED ON THE SUPPLIED DATABASE NAME
+CREATE OR ALTER PROCEDURE  usp_ShrinkFileInBatches  
+    @DatabaseName NVARCHAR(128),       -- Target database name
+    @ShrinkType NVARCHAR(10) = 'BOTH', -- Options: 'DATA', 'LOG', or 'BOTH'
+    @ShrinkBatchSizeMB INT = 500,      -- Batch size for shrinking (in MB)
+    @MaxTotalShrinkableMB INT = NULL   -- Total maximum shrinkable size (in MB), if not specified, it will be calculated based on free space
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @DatabaseName IS NULL OR LEN(@DatabaseName) = 0
+    BEGIN
+        PRINT 'Please specify a valid database name.';
+        RETURN;
+    END
+
+    -- Temporary table to store file info
+    CREATE TABLE #FileInfo (
+        FileID INT,
+        FileType NVARCHAR(10),
+        Name NVARCHAR(128),
+        SizeMB DECIMAL(18, 2),
+        UsedMB DECIMAL(18, 2),
+        FreeMB DECIMAL(18, 2),
+        MaxShrinkableSizeMB DECIMAL(18, 2),
+        ShrinkBatchSizeMB DECIMAL(18, 2),
+        TotalBatches INT,
+        ShrinkCommand NVARCHAR(MAX)
+    );
+
+    -- Switch to the target database and collect file information
+    DECLARE @SQL NVARCHAR(MAX);
+    SET @SQL = '
+        USE ' + QUOTENAME(@DatabaseName) + ';
+        INSERT INTO #FileInfo (FileID, FileType, Name, SizeMB, UsedMB, FreeMB, MaxShrinkableSizeMB, ShrinkBatchSizeMB, TotalBatches, ShrinkCommand)
+        SELECT 
+            file_id AS FileID,
+            CASE 
+                WHEN type = 0 THEN ''DATA''
+                WHEN type = 1 THEN ''LOG''
+                ELSE ''OTHER'' 
+            END AS FileType,
+            name AS Name,
+            size * 8.0 / 1024 AS SizeMB, -- Size in MB
+            FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024 AS UsedMB, -- Space used in MB
+            (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024) AS FreeMB, -- Free space in MB
+            CASE 
+                WHEN @MaxTotalShrinkableMB IS NULL THEN (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024) -- Default to all free space
+                ELSE CASE 
+                    WHEN ((size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)) > @MaxTotalShrinkableMB
+                    THEN @MaxTotalShrinkableMB
+                    ELSE (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)
+                END
+            END AS MaxShrinkableSizeMB,
+            @ShrinkBatchSizeMB AS ShrinkBatchSizeMB,
+            CASE 
+                WHEN ((size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)) > @ShrinkBatchSizeMB
+                THEN CEILING((CASE 
+                                WHEN @MaxTotalShrinkableMB IS NULL THEN (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)
+                                ELSE @MaxTotalShrinkableMB
+                              END) / @ShrinkBatchSizeMB)
+                ELSE 0 
+            END AS TotalBatches,
+            NULL AS ShrinkCommand
+        FROM sys.database_files
+        WHERE ((@ShrinkType = ''BOTH'') OR 
+               (@ShrinkType = ''DATA'' AND type = 0) OR 
+               (@ShrinkType = ''LOG'' AND type = 1));
+        ';
+
+    -- Execute the SQL to collect file information in the target database context
+    EXEC sp_executesql @SQL, 
+        N'@ShrinkBatchSizeMB INT, @MaxTotalShrinkableMB INT, @ShrinkType NVARCHAR(10)', 
+        @ShrinkBatchSizeMB, @MaxTotalShrinkableMB, @ShrinkType;
+
+    -- Generate loop-based shrinking commands with enforced limit
+    DECLARE @FileID INT, @FileName NVARCHAR(128), @MaxShrinkSize DECIMAL(18, 2), @BatchSize INT, @TotalBatches INT, @ShrinkCmd NVARCHAR(MAX);
+    DECLARE cur CURSOR FOR 
+    SELECT FileID, Name, MaxShrinkableSizeMB, ShrinkBatchSizeMB, TotalBatches
+    FROM #FileInfo
+    WHERE MaxShrinkableSizeMB > 0;
+
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @FileID, @FileName, @MaxShrinkSize, @BatchSize, @TotalBatches;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Loop-based command generation with the maximum shrinkable size
+        SET @ShrinkCmd = 'DECLARE @TotalShrinkedMB INT = 0;' + CHAR(13) + CHAR(10) +
+                         'WHILE @TotalShrinkedMB < ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + CHAR(13) + CHAR(10) +
+                         'BEGIN' + CHAR(13) + CHAR(10) +
+                         '    DBCC SHRINKFILE (' + QUOTENAME(@FileName) + ', ' + CAST(@BatchSize AS NVARCHAR(10)) + ');' + CHAR(13) + CHAR(10) +
+                         '    SET @TotalShrinkedMB += ' + CAST(@BatchSize AS NVARCHAR(10)) + ';' + CHAR(13) + CHAR(10) +
+                         '    IF @TotalShrinkedMB + ' + CAST(@BatchSize AS NVARCHAR(10)) + ' > ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + ' BREAK;' + CHAR(13) + CHAR(10) +
+                         'END;';
+
+        UPDATE #FileInfo
+        SET ShrinkCommand = @ShrinkCmd
+        WHERE FileID = @FileID;
+
+        FETCH NEXT FROM cur INTO @FileID, @FileName, @MaxShrinkSize, @BatchSize, @TotalBatches;
+    END
+
+    CLOSE cur;
+    DEALLOCATE cur;
+
+    -- Output the detailed results for each file
+    SELECT 
+        FileID,
+        FileType,
+        Name,
+        SizeMB,
+        UsedMB,
+        FreeMB,
+        MaxShrinkableSizeMB,
+        ShrinkBatchSizeMB,
+        TotalBatches,
+        ShrinkCommand
+    FROM #FileInfo;
+
+    -- Output the summary table with shrinkable details and commands
+    SELECT 
+        Name,
+        FileType,
+        MaxShrinkableSizeMB,
+        ShrinkBatchSizeMB,
+        CASE 
+            WHEN MaxShrinkableSizeMB > 0 THEN 'Recommended'
+            ELSE 'Not Recommended'
+        END AS ShrinkRecommendation,
+        ShrinkCommand
+    FROM #FileInfo
+    WHERE MaxShrinkableSizeMB > 0;
+
+    -- Drop temporary table
+    DROP TABLE #FileInfo;
+END;
+GO
+
+
+--- TO ALL THE DATABASES
+
+CREATE PROCEDURE usp_GenerateShrinkScriptsForAllDatabases
+    @ShrinkType NVARCHAR(10) = 'BOTH',      -- Options: 'DATA', 'LOG', or 'BOTH'
+    @ShrinkBatchSizeMB INT = 500,           -- Batch size for shrinking (in MB)
+    @MaxTotalShrinkableMB INT = NULL        -- Total maximum shrinkable size (in MB), if not specified, it will be calculated based on free space
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temporary table to store file info across all databases
+    CREATE TABLE #AllDatabasesFileInfo (
+        DatabaseName NVARCHAR(128),
+        FileID INT,
+        FileType NVARCHAR(10),
+        Name NVARCHAR(128),
+        SizeMB DECIMAL(18, 2),
+        UsedMB DECIMAL(18, 2),
+        FreeMB DECIMAL(18, 2),
+        MaxShrinkableSizeMB DECIMAL(18, 2),
+        ShrinkBatchSizeMB DECIMAL(18, 2),
+        TotalBatches INT,
+        ShrinkCommand NVARCHAR(MAX)
+    );
+
+    DECLARE @DatabaseName NVARCHAR(128);
+    DECLARE @SQL NVARCHAR(MAX);
+
+    -- Cursor to loop through all user databases
+    DECLARE db_cursor CURSOR FOR
+    SELECT name
+    FROM sys.databases
+    WHERE state = 0 -- Only online databases
+      AND database_id > 4 -- Exclude system databases (master, tempdb, model, msdb)
+
+    OPEN db_cursor;
+    FETCH NEXT FROM db_cursor INTO @DatabaseName;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Skip the current database if it matches the admin database where the stored procedure is located
+        IF @DatabaseName = DB_NAME() 
+        BEGIN
+            FETCH NEXT FROM db_cursor INTO @DatabaseName;
+            CONTINUE;
+        END
+
+        -- Switch to the target database and collect file information
+        SET @SQL = '
+            USE ' + QUOTENAME(@DatabaseName) + ';
+            INSERT INTO #AllDatabasesFileInfo (DatabaseName, FileID, FileType, Name, SizeMB, UsedMB, FreeMB, MaxShrinkableSizeMB, ShrinkBatchSizeMB, TotalBatches, ShrinkCommand)
+            SELECT 
+                ''' + @DatabaseName + ''' AS DatabaseName,
+                file_id AS FileID,
+                CASE 
+                    WHEN type = 0 THEN ''DATA''
+                    WHEN type = 1 THEN ''LOG''
+                    ELSE ''OTHER'' 
+                END AS FileType,
+                name AS Name,
+                size * 8.0 / 1024 AS SizeMB, -- Size in MB
+                FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024 AS UsedMB, -- Space used in MB
+                (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024) AS FreeMB, -- Free space in MB
+                CASE 
+                    WHEN @MaxTotalShrinkableMB IS NULL THEN (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024) -- Default to all free space
+                    ELSE CASE 
+                        WHEN ((size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)) > @MaxTotalShrinkableMB
+                        THEN @MaxTotalShrinkableMB
+                        ELSE (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)
+                    END
+                END AS MaxShrinkableSizeMB,
+                @ShrinkBatchSizeMB AS ShrinkBatchSizeMB,
+                CASE 
+                    WHEN ((size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)) > @ShrinkBatchSizeMB
+                    THEN CEILING((CASE 
+                                    WHEN @MaxTotalShrinkableMB IS NULL THEN (size * 8.0 / 1024) - (FILEPROPERTY(name, ''SpaceUsed'') * 8.0 / 1024)
+                                    ELSE @MaxTotalShrinkableMB
+                                  END) / @ShrinkBatchSizeMB)
+                    ELSE 0 
+                END AS TotalBatches,
+                NULL AS ShrinkCommand
+            FROM sys.database_files
+            WHERE ((@ShrinkType = ''BOTH'') OR 
+                   (@ShrinkType = ''DATA'' AND type = 0) OR 
+                   (@ShrinkType = ''LOG'' AND type = 1));
+            ';
+
+        -- Execute the SQL to collect file information in the target database context
+        EXEC sp_executesql @SQL, 
+            N'@ShrinkBatchSizeMB INT, @MaxTotalShrinkableMB INT, @ShrinkType NVARCHAR(10)', 
+            @ShrinkBatchSizeMB, @MaxTotalShrinkableMB, @ShrinkType;
+
+        FETCH NEXT FROM db_cursor INTO @DatabaseName;
+    END
+
+    CLOSE db_cursor;
+    DEALLOCATE db_cursor;
+
+    -- Generate shrink commands for each entry
+    DECLARE @FileID INT, @FileName NVARCHAR(128), @MaxShrinkSize DECIMAL(18, 2), @BatchSize INT, @TotalBatches INT, @ShrinkCmd NVARCHAR(MAX);
+    DECLARE cur CURSOR FOR 
+    SELECT DatabaseName, FileID, Name, MaxShrinkableSizeMB, ShrinkBatchSizeMB, TotalBatches
+    FROM #AllDatabasesFileInfo
+    WHERE MaxShrinkableSizeMB > 0;
+
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @DatabaseName, @FileID, @FileName, @MaxShrinkSize, @BatchSize, @TotalBatches;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Loop-based command generation with the maximum shrinkable size
+        SET @ShrinkCmd = 'DECLARE @TotalShrinkedMB INT = 0;' + CHAR(13) + CHAR(10) +
+                         'WHILE @TotalShrinkedMB < ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + CHAR(13) + CHAR(10) +
+                         'BEGIN' + CHAR(13) + CHAR(10) +
+                         '    DBCC SHRINKFILE (' + QUOTENAME(@FileName) + ', ' + CAST(@BatchSize AS NVARCHAR(10)) + ');' + CHAR(13) + CHAR(10) +
+                         '    SET @TotalShrinkedMB += ' + CAST(@BatchSize AS NVARCHAR(10)) + ';' + CHAR(13) + CHAR(10) +
+                         '    IF @TotalShrinkedMB + ' + CAST(@BatchSize AS NVARCHAR(10)) + ' > ' + CAST(@MaxShrinkSize AS NVARCHAR(18)) + ' BREAK;' + CHAR(13) + CHAR(10) +
+                         'END;';
+
+        UPDATE #AllDatabasesFileInfo
+        SET ShrinkCommand = @ShrinkCmd
+        WHERE DatabaseName = @DatabaseName AND FileID = @FileID;
+
+        FETCH NEXT FROM cur INTO @DatabaseName, @FileID, @FileName, @MaxShrinkSize, @BatchSize, @TotalBatches;
+    END
+
+    CLOSE cur;
+    DEALLOCATE cur;
+
+    -- Output the detailed results for each file in each database
+    SELECT 
+        DatabaseName,
+        FileID,
+        FileType,
+        Name,
+        SizeMB,
+        UsedMB,
+        FreeMB,
+        MaxShrinkableSizeMB,
+        ShrinkBatchSizeMB,
+        TotalBatches,
+        ShrinkCommand
+    FROM #AllDatabasesFileInfo;
+
+    -- Drop temporary table
+    DROP TABLE #AllDatabasesFileInfo;
+END;
+GO
